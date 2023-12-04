@@ -36,7 +36,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 model_checkpoint = "bert-base-uncased"
 lr = 1e-4
 batch_size = 16
-num_epochs = 2000
+num_epochs = 500
 load_model=False
 #output_dir = 'kwwww/test_16_2000'
 r_=1
@@ -74,7 +74,7 @@ imdb_split_10000 = imdb['train'].shard(num_shards=4, index=0) #100
 
 imdb_split_test = imdb['test'].shard(num_shards=4, index=0)
 
-imdb['train'] = imdb_split_1000
+imdb['train'] = imdb_split_100
 imdb['test'] = imdb_split_test
 
 bionlp = imdb
@@ -108,9 +108,13 @@ id2label = {0: "NEGATIVE", 1: "POSITIVE"}
 label2id = {"NEGATIVE": 0, "POSITIVE": 1}
 ############################################
 class CustomBertSelfAttention(models.bert.modeling_bert.BertSelfAttention):
-    def __init__(self, config):
+    def __init__(self, config, original_layer):
         super(CustomBertSelfAttention, self).__init__(config)
         self.scaling = lora_alpha/r_
+        
+        self.query = original_layer.query
+        self.key = original_layer.key
+        self.value = original_layer.value
         
         for param in self.parameters():
             param.requires_grad = False
@@ -293,9 +297,9 @@ model = AutoModelForSequenceClassification.from_pretrained(
 
 for param in model.parameters():
     param.requires_grad = False
-
+    
 for i in range(num_layer):
-    model.bert.encoder.layer[i].attention.self = CustomBertSelfAttention(model.config)
+    model.bert.encoder.layer[i].attention.self = CustomBertSelfAttention(model.config, model.bert.encoder.layer[i].attention.self)
 
 training_args = TrainingArguments(
     output_dir=output_dir,
