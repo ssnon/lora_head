@@ -190,5 +190,6 @@ pyrightconfig.json
 
 #instance folder
 kwwww/
+kwwww_past/
 
 # End of https://www.toptal.com/developers/gitignore/api/python,linux

@@ -22,6 +22,7 @@ import json
 import gzip
 import torch.nn as nn
 from typing import Any, List, Optional, Union
+import math
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 model_checkpoint = "bert-base-uncased"
@@ -32,6 +33,7 @@ load_model=False
 #output_dir = 'kwwww/test_16_2000'
 r_=1
 num_heads = 12
+use_headwise = False
 
 bionlp = load_dataset("imdb")
 
@@ -100,10 +102,7 @@ model = AutoModelForSequenceClassification.from_pretrained(
     model_checkpoint, num_labels=2, id2label=id2label, label2id=label2id
 )
 ############################################
-class MyCustomLoraLayer(peft.tuners.lora.layer.LoraLayer):
-    def __init__(self, base_layer: nn.Module, adapter_name, **kwargs) -> None:
-        super().__init__(base_layer = base_layer, **kwargs)
-        
+if use_headwise == True:
     def update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
         if r <= 0:
             raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
@@ -116,18 +115,17 @@ class MyCustomLoraLayer(peft.tuners.lora.layer.LoraLayer):
 
         self.lora_dropout.update(nn.ModuleDict({adapter_name: lora_dropout_layer}))
         # Actual trainable parameters
-        A_layers = []
-        B_layers = []
-        for i in range(num_heads):
-            layerA = nn.Linear(self.in_features, r, bias=False)
-            layerB = nn.Linear(r, self.out_features/num_heads, bias=False)
-            A_layers.append(layerA)
-            B_layers.append(layerB)
-            
-        self.A_q = nn.Sequential(*A_q)
-        self.B_q = nn.Sequential(*B_q)
-        
+        A_layers = nn.ModuleDict({})
+        B_layers = nn.ModuleDict({})
         if r > 0:
+            in_f = self.in_features
+            out_f = int(self.out_features / num_heads)
+            for i in range(num_heads):
+                layerA = nn.Linear(in_f, r, bias=False)
+                layerB = nn.Linear(r, out_f, bias=False)
+                A_layers[f'{i}'] = layerA
+                B_layers[f'{i}'] = layerB
+                
             self.lora_A[adapter_name] = A_layers
             self.lora_B[adapter_name] = B_layers
             self.scaling[adapter_name] = lora_alpha / r
@@ -146,30 +144,27 @@ class MyCustomLoraLayer(peft.tuners.lora.layer.LoraLayer):
                 self.to(weight.device)
         self.set_adapter(self.active_adapters)
         
-class MyCustomLinear(peft.tuners.lora.layer.Linear):
-    def __init__(
-        self,
-        base_layer,
-        adapter_name: str,
-        r: int = 1,
-        lora_alpha: int = 1,
-        lora_dropout: float = 0.0,
-        fan_in_fan_out: bool = False,  # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
-        is_target_conv_1d_layer: bool = False,
-        init_lora_weights: Union[bool, str] = True,
-        **kwargs,
-    ) -> None:
-        super().__init__(
-            base_layer = base_layer,
-            adapter_name =adapter_name,
-            r = 1,
-            lora_alpha = 1,
-            lora_dropout = 0.0,
-            fan_in_fan_out = False,  # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
-            is_target_conv_1d_layer = False,
-            init_lora_weights = True,
-            **kwargs,
-        )
+    def reset_lora_parameters(self, adapter_name, init_lora_weights):
+        if init_lora_weights is False:
+            return
+
+        if adapter_name in self.lora_A.keys():
+            for i in self.lora_A[adapter_name].keys():
+                if init_lora_weights is True:
+                    # initialize A the same way as the default for nn.Linear and B to zero
+                    # https://github.com/microsoft/LoRA/blob/a0a92e0f26c067cf94747bdbf1ce73793fa44d19/loralib/layers.py#L124
+                    nn.init.kaiming_uniform_(self.lora_A[adapter_name][i].weight, a=math.sqrt(5))
+                elif init_lora_weights.lower() == "gaussian":
+                    nn.init.normal_(self.lora_A[adapter_name][i].weight, std=1 / self.r[adapter_name])
+                else:
+                    raise ValueError(f"Unknown initialization {init_lora_weights=}")
+                nn.init.zeros_(self.lora_B[adapter_name][i].weight)
+        if adapter_name in self.lora_embedding_A.keys():
+            for i in self.lora_A[adapter_name].keys():
+                # initialize a the same way as the default for nn.linear and b to zero
+                nn.init.zeros_(self.lora_embedding_A[adapter_name][i])
+                nn.init.normal_(self.lora_embedding_B[adapter_name][i])
+
     def get_delta_weight(self, adapter) -> torch.Tensor:
         """
         Compute the delta weight for the given adapter.
@@ -186,12 +181,12 @@ class MyCustomLinear(peft.tuners.lora.layer.Linear):
         # float16 because the `@` and matmul operation in general is not supported in torch + cpu + fp16.
         cast_to_fp32 = device.type == "cpu" and dtype == torch.float16
         
-        A_weight_trunk = self.lora_A[adapter]
-        B_weight_trunk = self.lora_B[adapter]
+        A_weight_dict = self.lora_A[adapter]
+        B_weight_dict = self.lora_B[adapter]
         delta_weight_trunck = []
-        for i in range(num_heads):
-            weight_A = A_weight_trunk[i].weight
-            weight_B = B_weight_trunk[i].weight
+        for i in A_weight_dict.keys():
+            weight_A = A_weight_dict[i].weight
+            weight_B = B_weight_dict[i].weight
             delta_weight_trunck.append(weight_B @ weight_A)
             
         print(delta_weight.shape)
@@ -228,29 +223,25 @@ class MyCustomLinear(peft.tuners.lora.layer.Linear):
                 if active_adapter not in self.lora_A.keys():
                     continue
                 delta_weight_trunck = []
-                lora_A = self.lora_A[active_adapter]
-                lora_B = self.lora_B[active_adapter]
+                lora_A_dict = self.lora_A[active_adapter]
+                lora_B_dict = self.lora_B[active_adapter]
                 dropout = self.lora_dropout[active_adapter]
                 scaling = self.scaling[active_adapter]
-                x = x.to(lora_A.weight.dtype)
-                for i in range(num_heads):
-                    weight_A = lora_A[i].weight
-                    weight_B = lora_B[i].weight
-                    delta_weight_trunck.append(lora_B(lora_A(dropout(x))))
-                result += delta_weight_trunck * scaling
+                for i in lora_A_dict.keys():
+                    x = x.to(lora_A_dict[i].weight.dtype)
+                    weight_A = lora_A_dict[i]
+                    weight_B = lora_B_dict[i]
+                    delta_weight_trunck.append(weight_B(weight_A(dropout(x))))
+                delta_weight = torch.cat(delta_weight_trunck, dim=2)
+                result += delta_weight * scaling
 
         result = result.to(previous_dtype)
         return result
+    peft.tuners.lora.layer.LoraLayer.reset_lora_parameters = reset_lora_parameters
+    peft.tuners.lora.layer.LoraLayer.update_layer = update_layer
+    peft.tuners.lora.layer.Linear.get_delta_weight = get_delta_weight
+    peft.tuners.lora.layer.Linear.forward = forward
 ############################################
-layerB = nn.Linear(123,124)
-target = layerB
-layerA = nn.Linear(123,124)
-target2 = layerA
-
-adapter_name = 'default'
-#peft.tuners.lora.layer.LoraLayer = MyCustomLoraLayer(base_layer = target, adapter_name = adapter_name)
-peft.tuners.lora.layer.Linear = MyCustomLinear(base_layer = target2 , adapter_name = adapter_name)
-
 peft_config = LoraConfig(
     task_type=TaskType.SEQ_CLS, inference_mode=False, r=r_, lora_alpha=16, lora_dropout=0.1, bias="all"
 )
