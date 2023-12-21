@@ -5,99 +5,142 @@ from transformers import (
     DataCollatorForTokenClassification,
     TrainingArguments,
     Trainer,
-    AutoModelForCausalLM,
-    DataCollatorWithPadding,
-    AutoModelForSequenceClassification
+    AutoModelForCausalLM
 )
+from peft import get_peft_config, PeftModel, PeftConfig, get_peft_model, LoraConfig, TaskType
 import evaluate
 import torch
 import numpy as np
 from peft import AutoPeftModelForCausalLM, PeftModelForTokenClassification
-import peft
 import os
 from datasets import concatenate_datasets,DatasetDict
-from itertools import islice
-import json
-import gzip
 import torch.nn as nn
 from typing import Any, List, Optional, Union
 import math
+import peft
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 model_checkpoint = "bert-base-uncased"
-lr = 1e-5
-batch_size = 8
-num_epochs = 20
-load_model=True
+lr = 1e-3
+batch_size = 16
+num_epochs = 500
+load_model=False
 #output_dir = 'kwwww/test_16_2000'
-r_=1
+r_=64
 num_heads = 12
-use_headwise = True
+use_headwise = False
 
-bionlp = load_dataset("imdb")
+bionlp = load_dataset("tner/bionlp2004")
+bionlp_train1 = bionlp['train'].shard(num_shards=6, index=0)
+bionlp_train2 = concatenate_datasets([bionlp_train1, bionlp['train'].shard(num_shards=6, index=1)])
+bionlp_train3 = concatenate_datasets([bionlp_train2, bionlp['train'].shard(num_shards=6, index=2)])
+bionlp_train4 = concatenate_datasets([bionlp_train3, bionlp['train'].shard(num_shards=6, index=3)])
+bionlp_train5 = concatenate_datasets([bionlp_train4, bionlp['train'].shard(num_shards=6, index=4)])
+bionlp_train6 = concatenate_datasets([bionlp_train5, bionlp['train'].shard(num_shards=6, index=5)])
 
-bionlp_test1 = bionlp['test'].shard(num_shards=5, index=0)#5000
-bionlp_test2 = concatenate_datasets([bionlp_test1, bionlp['test'].shard(num_shards=5, index=1)])#10000
-bionlp_test3 = concatenate_datasets([bionlp_test2, bionlp['test'].shard(num_shards=5, index=2)])#15000
+bionlp_100 = bionlp['train'].shard(num_shards=16, index=0)
 
-bionlp_test_1 = bionlp['test'].shard(num_shards=5, index=3)
-bionlp_test_2 = concatenate_datasets([bionlp_test_1, bionlp['test'].shard(num_shards=5, index=4)])#10000
-
-bionlp['train'] = concatenate_datasets([bionlp['train'], bionlp_test3])#2000
-bionlp['test'] = bionlp_test_2
-
-
-imdb = bionlp
-
-imdb_split_100 = imdb['train'].shard(num_shards=400, index=0) #100
-imdb_split_200 = imdb['train'].shard(num_shards=200, index=0) #200
-imdb_split_500 = imdb['train'].shard(num_shards=80, index=0) #500
-imdb_split_1000 = imdb['train'].shard(num_shards=40, index=0) #1000
-imdb_split_2000 = imdb['train'].shard(num_shards=20, index=0) #100
-imdb_split_4000 = imdb['train'].shard(num_shards=10, index=0) #100
-imdb_split_4500 = imdb['train'].shard(num_shards=9, index=0) #100
-imdb_split_5000 = imdb['train'].shard(num_shards=8, index=0) #10
-imdb_split_5800 = imdb['train'].shard(num_shards=7, index=0) #100
-imdb_split_6500 = imdb['train'].shard(num_shards=6, index=0) #100
-imdb_split_8000 = imdb['train'].shard(num_shards=5, index=0) #100
-imdb_split_10000 = imdb['train'].shard(num_shards=4, index=0) #100
-
-imdb_split_test = imdb['test'].shard(num_shards=4, index=0)
-
-imdb['train'] = imdb_split_100
-imdb['test'] = imdb_split_test
-
-bionlp = imdb
-print(bionlp)
-
-split_size = bionlp['train'].shape[0]
-output_dir =  f'kwwww/{model_checkpoint}_{r_}_{split_size}'
+bionlp_split = DatasetDict({"train":bionlp_train1,'validation':bionlp['validation'], "test":bionlp['test']})
+split_size = bionlp_split['train'].shape[0]
+output_dir =  f'kwwww/{model_checkpoint}_{r_}_{split_size}_token'
 if use_headwise == True:
-    output_dir =  f'kwwww/{model_checkpoint}_{r_}_{split_size}_headwise'
+    output_dir =  f'kwwww/{model_checkpoint}_{r_}_{split_size}_token_headwise'
 seqeval = evaluate.load("seqeval")
-accuracy = evaluate.load("accuracy")
-f1_metric = evaluate.load("f1")
+label_list = [
+    "O",
+    "B-DNA",
+    "I-DNA",
+    "B-protein",
+    "I-protein",
+    "B-cell_type",
+    "I-cell_type",
+    "B-cell_line",
+    "I-cell_line",
+    "B-RNA",
+    "I-RNA",
+]
 
-def compute_metrics(eval_pred):
-    predictions, labels = eval_pred
-    predictions = np.argmax(predictions, axis=1)
-    acc = accuracy.compute(predictions=predictions, references=labels)
-    f1 = f1_metric.compute(predictions=predictions, references=labels)
-    return {"f1": f1, "accuracy": acc}
+
+def compute_metrics(p):
+    predictions, labels = p
+    predictions = np.argmax(predictions, axis=2)
+
+    true_predictions = [
+        [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
+        for prediction, label in zip(predictions, labels)
+    ]
+    true_labels = [
+        [label_list[l] for (p, l) in zip(prediction, label) if l != -100]
+        for prediction, label in zip(predictions, labels)
+    ]
+
+    results = seqeval.compute(predictions=true_predictions, references=true_labels)
+    return {
+        "precision": results["overall_precision"],
+        "recall": results["overall_recall"],
+        "f1": results["overall_f1"],
+        "accuracy": results["overall_accuracy"],
+    }
     
 tokenizer = AutoTokenizer.from_pretrained(model_checkpoint, add_prefix_space=True)
 
-def preprocess_function(examples):
-    return tokenizer(examples["text"], truncation=True)
+if load_model==True:
+    tokenizer = AutoTokenizer.from_pretrained(output_dir)
     
-tokenized_bionlp = bionlp.map(preprocess_function, batched=True)
-data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+def tokenize_and_align_labels(examples):
+    tokenized_inputs = tokenizer(examples["tokens"], truncation=True, is_split_into_words=True)
 
-id2label = {0: "NEGATIVE", 1: "POSITIVE"}
-label2id = {"NEGATIVE": 0, "POSITIVE": 1}
+    labels = []
+    for i, label in enumerate(examples[f"tags"]):
+        word_ids = tokenized_inputs.word_ids(batch_index=i)
+        previous_word_idx = None
+        label_ids = []
+        for word_idx in word_ids:
+            if word_idx is None:
+                label_ids.append(-100)
+            elif word_idx != previous_word_idx:
+                label_ids.append(label[word_idx])
+            else:
+                label_ids.append(-100)
+            previous_word_idx = word_idx
+        labels.append(label_ids)
 
-model = AutoModelForSequenceClassification.from_pretrained(
-    model_checkpoint, num_labels=2, id2label=id2label, label2id=label2id
+    tokenized_inputs["labels"] = labels
+    return tokenized_inputs
+    
+tokenized_bionlp = bionlp_split.map(tokenize_and_align_labels, batched=True)
+data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer)
+
+
+id2label = {
+    0: "O",
+    1: "B-DNA",
+    2: "I-DNA",
+    3: "B-protein",
+    4: "I-protein",
+    5: "B-cell_type",
+    6: "I-cell_type",
+    7: "B-cell_line",
+    8: "I-cell_line",
+    9: "B-RNA",
+    10: "I-RNA",
+}
+label2id = {
+    "O": 0,
+    "B-DNA": 1,
+    "I-DNA": 2,
+    "B-protein": 3,
+    "I-protein": 4,
+    "B-cell_type": 5,
+    "I-cell_type": 6,
+    "B-cell_line": 7,
+    "I-cell_line": 8,
+    "B-RNA": 9,
+    "I-RNA": 10,
+}
+
+model = AutoModelForTokenClassification.from_pretrained(
+    model_checkpoint, num_labels=11, id2label=id2label, label2id=label2id
 )
 ############################################
 if use_headwise == True:
@@ -187,8 +230,6 @@ if use_headwise == True:
             weight_B = B_weight_dict[i].weight
             delta_weight_trunck.append(weight_B @ weight_A)
             
-        print(delta_weight.shape)
-        input()
         delta_weight = torch.cat(delta_weight_trunck, dim=2)
 
         if cast_to_fp32:
@@ -208,7 +249,7 @@ if use_headwise == True:
         
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         previous_dtype = x.dtype
-
+        
         if self.disable_adapters:
             if self.merged:
                 self.unmerge()
@@ -240,17 +281,18 @@ if use_headwise == True:
     peft.tuners.lora.layer.Linear.get_delta_weight = get_delta_weight
     peft.tuners.lora.layer.Linear.forward = forward
 ############################################
-peft_config = peft.LoraConfig(
-    task_type=peft.TaskType.SEQ_CLS, inference_mode=False, r=r_, lora_alpha=16, lora_dropout=0.1, bias="all"
+peft_config = LoraConfig(
+    task_type=TaskType.TOKEN_CLS, inference_mode=False, r=r_, lora_alpha=16, lora_dropout=0.1, bias="all"
 )
 
-model = peft.get_peft_model(model, peft_config)
+model = get_peft_model(model, peft_config)
 model.print_trainable_parameters()
 
 if load_model==True:
-    checkpoint_path = os.path.join(output_dir, "model_weights_epoch50.pth")
-    checkpoint = torch.load(checkpoint_path)
-    model.load_state_dict(checkpoint)
+    peft_model_id = output_dir
+    config = PeftConfig.from_pretrained(peft_model_id)
+    model = AutoModelForTokenClassification.from_pretrained(model_checkpoint, num_labels=11, id2label=id2label, label2id=label2id)
+    model = PeftModel.from_pretrained(model, peft_model_id)
     
 training_args = TrainingArguments(
     output_dir=output_dir,
@@ -262,45 +304,18 @@ training_args = TrainingArguments(
     evaluation_strategy="epoch",
     save_strategy="epoch",
     save_total_limit=5,
-    load_best_model_at_end=True
+    load_best_model_at_end=True,
+    push_to_hub=True
 )
 
-class MyCallback:
-    def __init__(self, model):
-        self.model = model
-    def on_init_end(self, args, state, control, **kwargs):
-        pass
-    def on_train_begin(self, args, state, control, **kwargs):
-        pass
-    def on_epoch_begin(self, args, state, control, **kwargs):
-        pass
-    def on_step_begin(self, args, state, control, **kwargs):
-        pass
-    def on_step_end(self, args, state, control, **kwargs):
-        pass
-        
-    def on_epoch_end(self, args, state, control, **kwargs):
-        pass
-            
-    def on_prediction_step(self, args, state, control, **kwargs):
-        pass
-    def on_log(self, args, state, control, **kwargs):
-        pass
-    def on_evaluate(self, args, state, control, **kwargs):
-        pass
-    def on_save(self, args, state, control, **kwargs):
-        pass
-    def on_train_end(self, args, state, control, **kwargs):
-        pass
 trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=tokenized_bionlp["train"],
-    eval_dataset=tokenized_bionlp["test"],
+    eval_dataset=tokenized_bionlp["validation"],
     tokenizer=tokenizer,
     data_collator=data_collator,
     compute_metrics=compute_metrics,
-    callbacks=[MyCallback(model)],
 )
 
 trainer.train()
@@ -310,7 +325,7 @@ torch.save(model.state_dict(), output_dir_1)
 
 trainer.push_to_hub()
 
-REPO_NAME = output_dir # ex) 'my-bert-fine-tuned'
+REPO_NAME = f'{model_checkpoint}-test_{r_}_{split_size}' # ex) 'my-bert-fine-tuned'
 AUTH_TOKEN = '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' # <https://huggingface.co/settings/token>
 
 model.push_to_hub(

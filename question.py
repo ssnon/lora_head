@@ -6,99 +6,103 @@ from transformers import (
     TrainingArguments,
     Trainer,
     AutoModelForCausalLM,
-    DataCollatorWithPadding,
-    AutoModelForSequenceClassification
+    DefaultDataCollator,
+    AutoModelForQuestionAnswering
 )
+from peft import get_peft_config, PeftModel, PeftConfig, get_peft_model, LoraConfig, TaskType
 import evaluate
 import torch
 import numpy as np
 from peft import AutoPeftModelForCausalLM, PeftModelForTokenClassification
-import peft
 import os
 from datasets import concatenate_datasets,DatasetDict
-from itertools import islice
-import json
-import gzip
 import torch.nn as nn
 from typing import Any, List, Optional, Union
 import math
+import peft
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 model_checkpoint = "bert-base-uncased"
-lr = 1e-5
+lr = 1e-3
 batch_size = 8
-num_epochs = 20
-load_model=True
+num_epochs = 1000
+load_model=False
 #output_dir = 'kwwww/test_16_2000'
 r_=1
 num_heads = 12
 use_headwise = True
 
-bionlp = load_dataset("imdb")
+squad = load_dataset("squad", split="train[:5000]")
+squad = squad.train_test_split(test_size=0.2)
+split_size = squad['train'].shape[0]
 
-bionlp_test1 = bionlp['test'].shard(num_shards=5, index=0)#5000
-bionlp_test2 = concatenate_datasets([bionlp_test1, bionlp['test'].shard(num_shards=5, index=1)])#10000
-bionlp_test3 = concatenate_datasets([bionlp_test2, bionlp['test'].shard(num_shards=5, index=2)])#15000
-
-bionlp_test_1 = bionlp['test'].shard(num_shards=5, index=3)
-bionlp_test_2 = concatenate_datasets([bionlp_test_1, bionlp['test'].shard(num_shards=5, index=4)])#10000
-
-bionlp['train'] = concatenate_datasets([bionlp['train'], bionlp_test3])#2000
-bionlp['test'] = bionlp_test_2
-
-
-imdb = bionlp
-
-imdb_split_100 = imdb['train'].shard(num_shards=400, index=0) #100
-imdb_split_200 = imdb['train'].shard(num_shards=200, index=0) #200
-imdb_split_500 = imdb['train'].shard(num_shards=80, index=0) #500
-imdb_split_1000 = imdb['train'].shard(num_shards=40, index=0) #1000
-imdb_split_2000 = imdb['train'].shard(num_shards=20, index=0) #100
-imdb_split_4000 = imdb['train'].shard(num_shards=10, index=0) #100
-imdb_split_4500 = imdb['train'].shard(num_shards=9, index=0) #100
-imdb_split_5000 = imdb['train'].shard(num_shards=8, index=0) #10
-imdb_split_5800 = imdb['train'].shard(num_shards=7, index=0) #100
-imdb_split_6500 = imdb['train'].shard(num_shards=6, index=0) #100
-imdb_split_8000 = imdb['train'].shard(num_shards=5, index=0) #100
-imdb_split_10000 = imdb['train'].shard(num_shards=4, index=0) #100
-
-imdb_split_test = imdb['test'].shard(num_shards=4, index=0)
-
-imdb['train'] = imdb_split_100
-imdb['test'] = imdb_split_test
-
-bionlp = imdb
-print(bionlp)
-
-split_size = bionlp['train'].shape[0]
-output_dir =  f'kwwww/{model_checkpoint}_{r_}_{split_size}'
+output_dir =  f'kwwww/{model_checkpoint}_{r_}_{split_size}_question'
 if use_headwise == True:
-    output_dir =  f'kwwww/{model_checkpoint}_{r_}_{split_size}_headwise'
+    output_dir =  f'kwwww/{model_checkpoint}_{r_}_{split_size}_question_headwise'
 seqeval = evaluate.load("seqeval")
-accuracy = evaluate.load("accuracy")
-f1_metric = evaluate.load("f1")
-
-def compute_metrics(eval_pred):
-    predictions, labels = eval_pred
-    predictions = np.argmax(predictions, axis=1)
-    acc = accuracy.compute(predictions=predictions, references=labels)
-    f1 = f1_metric.compute(predictions=predictions, references=labels)
-    return {"f1": f1, "accuracy": acc}
-    
-tokenizer = AutoTokenizer.from_pretrained(model_checkpoint, add_prefix_space=True)
 
 def preprocess_function(examples):
-    return tokenizer(examples["text"], truncation=True)
+    questions = [q.strip() for q in examples["question"]]
+    inputs = tokenizer(
+        questions,
+        examples["context"],
+        max_length=384,
+        truncation="only_second",
+        return_offsets_mapping=True,
+        padding="max_length",
+    )
+
+    offset_mapping = inputs.pop("offset_mapping")
+    answers = examples["answers"]
+    start_positions = []
+    end_positions = []
+
+    for i, offset in enumerate(offset_mapping):
+        answer = answers[i]
+        start_char = answer["answer_start"][0]
+        end_char = answer["answer_start"][0] + len(answer["text"][0])
+        sequence_ids = inputs.sequence_ids(i)
+
+        # Find the start and end of the context
+        idx = 0
+        while sequence_ids[idx] != 1:
+            idx += 1
+        context_start = idx
+        while sequence_ids[idx] == 1:
+            idx += 1
+        context_end = idx - 1
+
+        # If the answer is not fully inside the context, label it (0, 0)
+        if offset[context_start][0] > end_char or offset[context_end][1] < start_char:
+            start_positions.append(0)
+            end_positions.append(0)
+        else:
+            # Otherwise it's the start and end token positions
+            idx = context_start
+            while idx <= context_end and offset[idx][0] <= start_char:
+                idx += 1
+            start_positions.append(idx - 1)
+
+            idx = context_end
+            while idx >= context_start and offset[idx][1] >= end_char:
+                idx -= 1
+            end_positions.append(idx + 1)
+
+    inputs["start_positions"] = start_positions
+    inputs["end_positions"] = end_positions
+    return inputs
     
-tokenized_bionlp = bionlp.map(preprocess_function, batched=True)
-data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-id2label = {0: "NEGATIVE", 1: "POSITIVE"}
-label2id = {"NEGATIVE": 0, "POSITIVE": 1}
+tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
 
-model = AutoModelForSequenceClassification.from_pretrained(
-    model_checkpoint, num_labels=2, id2label=id2label, label2id=label2id
-)
+if load_model==True:
+    tokenizer = AutoTokenizer.from_pretrained(output_dir)
+    
+tokenized_squad = squad.map(preprocess_function, batched=True, remove_columns=squad["train"].column_names)
+data_collator = DefaultDataCollator()
+
+
+model = AutoModelForQuestionAnswering.from_pretrained(model_checkpoint)
 ############################################
 if use_headwise == True:
     def update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
@@ -240,17 +244,19 @@ if use_headwise == True:
     peft.tuners.lora.layer.Linear.get_delta_weight = get_delta_weight
     peft.tuners.lora.layer.Linear.forward = forward
 ############################################
-peft_config = peft.LoraConfig(
-    task_type=peft.TaskType.SEQ_CLS, inference_mode=False, r=r_, lora_alpha=16, lora_dropout=0.1, bias="all"
+
+peft_config = LoraConfig(
+    task_type=TaskType.QUESTION_ANS, inference_mode=False, r=r_, lora_alpha=16, lora_dropout=0.1, bias="all"
 )
 
-model = peft.get_peft_model(model, peft_config)
+model = get_peft_model(model, peft_config)
 model.print_trainable_parameters()
 
 if load_model==True:
-    checkpoint_path = os.path.join(output_dir, "model_weights_epoch50.pth")
-    checkpoint = torch.load(checkpoint_path)
-    model.load_state_dict(checkpoint)
+    peft_model_id = output_dir
+    config = PeftConfig.from_pretrained(peft_model_id)
+    model = AutoModelForTokenClassification.from_pretrained(model_checkpoint, num_labels=9, id2label=id2label, label2id=label2id)
+    model = PeftModel.from_pretrained(model, peft_model_id)
     
 training_args = TrainingArguments(
     output_dir=output_dir,
@@ -264,53 +270,19 @@ training_args = TrainingArguments(
     save_total_limit=5,
     load_best_model_at_end=True
 )
-
-class MyCallback:
-    def __init__(self, model):
-        self.model = model
-    def on_init_end(self, args, state, control, **kwargs):
-        pass
-    def on_train_begin(self, args, state, control, **kwargs):
-        pass
-    def on_epoch_begin(self, args, state, control, **kwargs):
-        pass
-    def on_step_begin(self, args, state, control, **kwargs):
-        pass
-    def on_step_end(self, args, state, control, **kwargs):
-        pass
-        
-    def on_epoch_end(self, args, state, control, **kwargs):
-        pass
-            
-    def on_prediction_step(self, args, state, control, **kwargs):
-        pass
-    def on_log(self, args, state, control, **kwargs):
-        pass
-    def on_evaluate(self, args, state, control, **kwargs):
-        pass
-    def on_save(self, args, state, control, **kwargs):
-        pass
-    def on_train_end(self, args, state, control, **kwargs):
-        pass
 trainer = Trainer(
     model=model,
     args=training_args,
-    train_dataset=tokenized_bionlp["train"],
-    eval_dataset=tokenized_bionlp["test"],
+    train_dataset=tokenized_squad["train"],
+    eval_dataset=tokenized_squad["test"],
     tokenizer=tokenizer,
-    data_collator=data_collator,
-    compute_metrics=compute_metrics,
-    callbacks=[MyCallback(model)],
+    data_collator=data_collator
 )
 
 trainer.train()
-
-output_dir_1 = os.path.join(output_dir, "model_weights_epoch4.pth")
-torch.save(model.state_dict(), output_dir_1)
-
 trainer.push_to_hub()
 
-REPO_NAME = output_dir # ex) 'my-bert-fine-tuned'
+REPO_NAME = f'{model_checkpoint}-test_{r_}_{split_size}' # ex) 'my-bert-fine-tuned'
 AUTH_TOKEN = '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' # <https://huggingface.co/settings/token>
 
 model.push_to_hub(
